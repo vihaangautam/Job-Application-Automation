@@ -21,7 +21,7 @@ def print_banner():
     print("3. Naukri Bot")
     print("4. Glassdoor Bot")
     print("5. Foundit (Monster) Bot")
-    print("6. Run ALL Concurrently (Warning: Heavy System Load)")
+    print("6. Run ALL Sequentially")
     print("==============================================================")
 
 def run_linkedin():
@@ -64,13 +64,59 @@ def run_foundit():
     except ImportError as e:
         log.error(f"Failed to load Foundit Bot: {e}. Has it been implemented?")
 
-def run_all_concurrently():
-    log.info("Starting ALL platforms concurrently!")
+def pre_login_all():
+    log.info("Opening all platforms for a one-time pre-login...")
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+    from selenium.webdriver.chrome.options import Options
+    
+    options = Options()
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    
+    user_data_dir = os.path.join(os.getcwd(), "chrome_profile")
+    options.add_argument(f"user-data-dir={user_data_dir}")
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    
+    urls = [
+        "https://www.linkedin.com/login",
+        "https://secure.indeed.com/auth",
+        "https://login.naukri.com/nLogin/Login.php",
+        "https://www.glassdoor.co.in/profile/login_input.htm",
+        "https://www.foundit.in/rio/login"
+    ]
+    
+    driver.get(urls[0])
+    for url in urls[1:]:
+        driver.execute_script(f"window.open('{url}', '_blank');")
+        
+    print("\n" + "="*60)
+    print("🤖 [GYM MODE: PRE-LOGIN FOR ALL PLATFORMS] 🤖")
+    print("I have opened tabs for all 5 platforms.")
+    print("Please go to the Chrome window and log into ALL of them.")
+    print("Once you are fully logged into all platforms, press ENTER below.")
+    input("👉 Press ENTER here when ready to go to the gym... ")
+    print("="*60 + "\n")
+    
+    driver.quit()
+
+def run_all_sequentially():
+    log.info("Starting ALL platforms sequentially to avoid browser conflicts...")
+    pre_login_all()
+    os.environ["SKIP_LOGIN_PROMPT"] = "1"
+    
     bots = [run_linkedin, run_indeed, run_naukri, run_glassdoor, run_foundit]
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        for bot in bots:
-            executor.submit(bot)
+    for bot in bots:
+        bot()
+        log.info("-" * 60)
+        
+    os.environ.pop("SKIP_LOGIN_PROMPT", None)
 
 def main():
     print_banner()
@@ -87,7 +133,7 @@ def main():
     elif choice == "5":
         run_foundit()
     elif choice == "6":
-        run_all_concurrently()
+        run_all_sequentially()
     else:
         print("Invalid choice. Exiting.")
 

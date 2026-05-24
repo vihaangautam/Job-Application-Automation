@@ -41,7 +41,12 @@ def foundit_login(driver):
     print("🤖 [ACTION REQUIRED] 🤖")
     print("Please login manually to FOUNDIT in the Chrome window.")
     print("If it asks for OTP or Captcha, please complete it.")
-    input("👉 Press ENTER here in the terminal when you are fully logged in... ")
+    import os, time
+    if not os.environ.get("SKIP_LOGIN_PROMPT"):
+        input("👉 Press ENTER here in the terminal when you are fully logged in... ")
+    else:
+        log.info("Gym mode active! Skipping manual ENTER prompt.")
+        time.sleep(3)
     print("="*60 + "\n")
     
     log.info("✅ Proceeding to Foundit Job Search...")

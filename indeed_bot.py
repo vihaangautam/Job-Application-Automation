@@ -10,6 +10,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
 
 import config
+from llm_answerer import find_answer
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,12 @@ def indeed_login(driver):
     print("🤖 [ACTION REQUIRED] 🤖")
     print("Please login manually in the Chrome window using Google, Apple, or Email.")
     print("If it asks for OTP or Captcha, please complete it.")
-    input("👉 Press ENTER here in the terminal when you are fully logged in... ")
+    import os, time
+    if not os.environ.get("SKIP_LOGIN_PROMPT"):
+        input("👉 Press ENTER here in the terminal when you are fully logged in... ")
+    else:
+        log.info("Gym mode active! Skipping manual ENTER prompt.")
+        time.sleep(3)
     print("="*60 + "\n")
     
     log.info("✅ Proceeding to Job Search...")
@@ -52,25 +58,7 @@ def search_jobs(driver, keyword):
     driver.get(url)
     time.sleep(5)
 
-# ─── Smart Answer Engine ──────────────────────────────────────
-def find_answer(question_text):
-    q = question_text.lower().strip()
-    for keyword, answer in config.SAVED_ANSWERS.items():
-        if keyword.lower() in q:
-            return str(answer)
-
-    # Default fallbacks
-    if any(w in q for w in ["year", "experience", "how long", "how many"]):
-        return "5"
-    if any(w in q for w in ["salary", "ctc", "compensation", "pay"]):
-        return "800000"
-    if any(w in q for w in ["notice", "join", "start", "available"]):
-        return "Immediately"
-    if any(w in q for w in ["yes", "no", "are you", "do you", "have you", "can you"]):
-        return "Yes"
-
-    log.warning(f"⚠️  Unknown question: {question_text[:60]}... → defaulting to 'Yes'")
-    return "Yes"
+# find_answer is imported from llm_answerer.py
 
 def human_type(element, text):
     for char in str(text):
