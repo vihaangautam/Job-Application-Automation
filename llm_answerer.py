@@ -1,37 +1,105 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║   LLM-Powered Answer Engine for Job Application Bots        ║
-║   Uses Ollama (local LLM) for intelligent form filling      ║
+║   LLM-Powered Answer Engine for Job Application Bots         ║
+║   Uses Ollama (local LLM) for intelligent form filling       ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Replaces the dumb keyword-matching find_answer() with a 3-tier system:
   1. Deterministic rules (personal info — instant)
   2. Keyword matching (SAVED_ANSWERS — instant)
   3. Ollama LLM (intelligent fallback — 1-3 seconds)
+
+Includes SQLite caching to prevent redundant local LLM calls.
 """
 
 import json
+import difflib
 import urllib.request
 import urllib.error
 import logging
+import sqlite3
+import hashlib
+import re
 import config
 
 log = logging.getLogger(__name__)
 
-# ─── Cache to avoid duplicate LLM calls ─────────────────────
-_answer_cache = {}
+# ─── SQLite Cache to avoid duplicate LLM calls ─────────────────────
+DB_PATH = "answer_cache.db"
 
+def init_cache():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                key TEXT PRIMARY KEY,
+                answer TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.warning(f"Cache database init failed: {e}")
+
+# Initialize the cache database when the module is imported
+init_cache()
+
+def cache_key(question, options, is_numeric=False):
+    raw = question.strip().lower() + str(sorted(options or [])) + f"|num:{is_numeric}"
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def get_cached(question, options, is_numeric=False):
+    try:
+        key = cache_key(question, options, is_numeric)
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT answer FROM cache WHERE key=?", (key,)).fetchone()
+        con.close()
+        return row[0] if row else None
+    except Exception as e:
+        log.debug(f"Cache read error: {e}")
+        return None
+
+def set_cached(question, options, answer, is_numeric=False):
+    try:
+        key = cache_key(question, options, is_numeric)
+        con = sqlite3.connect(DB_PATH)
+        con.execute("INSERT OR REPLACE INTO cache VALUES (?,?)", (key, answer))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log.debug(f"Cache write error: {e}")
 
 # ─── Build Profile Context for LLM ──────────────────────────
 def _build_profile_context():
-    """Build a rich text context from all config.py data."""
+    """Build a rich text context from all config.py data and inject detailed resume if available."""
+    import os
     p = config.PERSONAL
     e = config.EDUCATION
     exp = config.EXPERIENCE
     w = config.WORK_AUTH
-    s = config.SKILLS
+    
+    # Clone technical skills from config to avoid mutating original
+    s = {k: list(v) for k, v in config.SKILLS.items()}
+    
+    # Dynamically inject enabled adjacent skills to the profile context
+    adaptive_cfg = getattr(config, "ADAPTIVE_LYING", {})
+    if adaptive_cfg.get("enabled", False):
+        adjacent_skills = adaptive_cfg.get("adjacent_skills", {})
+        for skill_name, is_enabled in adjacent_skills.items():
+            if is_enabled:
+                name_cap = skill_name.capitalize()
+                if skill_name.lower() == "typescript" and "TypeScript" not in s["languages"]:
+                    s["languages"].append("TypeScript")
+                elif skill_name.lower() == "flask" and "Flask" not in s["frameworks"]:
+                    s["frameworks"].append("Flask")
+                elif skill_name.lower() == "graphql" and "GraphQL" not in s["databases"]:
+                    s["databases"].append("GraphQL")
+                elif skill_name.lower() not in ["typescript", "flask", "graphql"]:
+                    # Fallback general injection
+                    if name_cap not in s["tools"]:
+                        s["tools"].append(name_cap)
 
-    context = f"""CANDIDATE PROFILE:
+    base = f"""CANDIDATE PROFILE:
 - Name: {p['first_name']} {p['last_name']}
 - Email: {p['email']}
 - Phone: {p['phone']}
@@ -74,63 +142,78 @@ TECHNICAL SKILLS:
 LANGUAGES SPOKEN: {', '.join(config.LANGUAGES_SPOKEN)}
 
 CERTIFICATIONS: {'; '.join(config.CERTIFICATIONS)}"""
-    return context
 
-
-# ─── System Prompt (built once, cached) ──────────────────────
-_SYSTEM_PROMPT = None
-
-def _get_system_prompt():
-    global _SYSTEM_PROMPT
-    if _SYSTEM_PROMPT is None:
-        profile = _build_profile_context()
-        _SYSTEM_PROMPT = f"""You are a job application form assistant. You answer questions for a candidate applying to jobs.
-
-{profile}
-
-STRICT RULES — follow these exactly:
-1. Give SHORT, DIRECT answers only. No explanations, no reasoning, no preamble.
-2. For Yes/No questions → answer ONLY "Yes" or "No".
-3. For numeric questions (years, salary, count) → answer with ONLY a number.
-4. For technology experience questions (e.g., "years of Python experience"):
-   - If the candidate knows the technology → answer "1"
-   - If they don't know it → answer "0"
-5. When dropdown options are provided → respond with the EXACT text of the best matching option.
-6. For text fields asking "why" or "describe" → give a 1-2 sentence professional answer.
-7. For name/contact/URL fields → use the candidate's actual data.
-8. For salary → use annual INR figures unless the question specifies otherwise.
-9. For willingness questions (relocate, travel, remote, overtime) → answer "Yes".
-10. For cover letter requests → write 2-3 concise, professional sentences about the candidate's fit.
-11. NEVER say "I don't know", "N/A", or ask clarifying questions. Always provide a concrete answer.
-12. NEVER wrap your answer in quotes unless the question asks for a quoted string.
-13. If the question mentions a specific skill/technology the candidate does NOT have, be honest but brief (say "0" for years or "No" for familiarity)."""
-    return _SYSTEM_PROMPT
+    # Inject detailed SDE resume if available
+    resume_path = getattr(config, "RESUME_TXT_PATH", "resume.md")
+    if os.path.exists(resume_path):
+        try:
+            with open(resume_path, "r", encoding="utf-8") as f:
+                resume_text = f.read()
+            base += f"\n\nDETAILED RESUME & PROJECTS:\n{resume_text}"
+        except Exception as err:
+            log.warning(f"Failed to read detailed resume file at {resume_path}: {err}")
+    
+    return base.strip()
 
 
 # ─── Ollama API Call ─────────────────────────────────────────
-def _call_ollama(question, options=None):
-    """Call Ollama local LLM to get an intelligent answer."""
-    prompt = f'Job application form question: "{question}"'
+def _call_ollama(question, options=None, is_numeric=False):
+    """Call Ollama local LLM to get an intelligent answer based on prompt constraints."""
+    profile = _build_profile_context()
+
+    # Construct smart extrapolation / adaptive lying guidelines if enabled in config
+    adaptive_guidelines = ""
+    adaptive_cfg = getattr(config, "ADAPTIVE_LYING", {})
+    if adaptive_cfg.get("enabled", False):
+        adjacent = [k for k, v in adaptive_cfg.get("adjacent_skills", {}).items() if v]
+        non_adjacent = [k for k, v in adaptive_cfg.get("adjacent_skills", {}).items() if not v]
+        default_unknown = adaptive_cfg.get("default_unknown", "1")
+        adaptive_guidelines = f"""
+ADAPTIVE SKILLS RULES (Case-Insensitive):
+If asked about a technology/skill NOT explicitly mentioned in the profile or resume:
+- If it matches a skill in this learnable list {adjacent} (case-insensitive): answer "Yes" or "{default_unknown}".
+- Otherwise (or if it matches a skill in {non_adjacent}): answer "No" or "0".
+"""
+
     if options:
-        # Filter out empty options
-        clean_options = [o.strip() for o in options if o.strip() and o.strip() != "Select an option"]
-        if clean_options:
-            prompt += f"\n\nAvailable options to choose from:\n"
-            for i, opt in enumerate(clean_options, 1):
-                prompt += f"  {i}. {opt}\n"
-            prompt += "\nRespond with EXACTLY one of the options above, word for word."
-    prompt += "\n\nYour answer:"
+        # Dropdown Option Picker
+        prompt = f"""You are filling a job application form.
+CANDIDATE PROFILE:
+{profile}
+{adaptive_guidelines}
+QUESTION: {question}
+You MUST answer with EXACTLY one of the following available options, word for word, and absolutely nothing else:
+{chr(10).join(options)}
+
+Answer:"""
+    elif is_numeric:
+        # Numeric field
+        prompt = f"""You are filling a job application form.
+CANDIDATE PROFILE:
+{profile}
+{adaptive_guidelines}
+QUESTION: {question}
+Reply with a single integer only. No words, no units, no punctuation.
+Answer:"""
+    else:
+        # Free text description
+        prompt = f"""You are filling a job application form.
+CANDIDATE PROFILE:
+{profile}
+{adaptive_guidelines}
+QUESTION: {question}
+Reply in under 10 words. Be specific, concise, and highly professional.
+Answer:"""
 
     payload = {
         "model": config.OLLAMA_MODEL,
         "messages": [
-            {"role": "system", "content": _get_system_prompt()},
             {"role": "user", "content": prompt}
         ],
         "stream": False,
         "options": {
-            "temperature": 0.1,   # Low temperature for consistent answers
-            "num_predict": 150,   # Keep answers short
+            "temperature": 0.1,   # Low temperature for highly consistent answers
+            "num_predict": 100,   # Keep answers short
         }
     }
 
@@ -145,19 +228,18 @@ def _call_ollama(question, options=None):
 
             # Clean up common LLM artifacts
             answer = answer.strip('"\'')
-            # Remove "Answer:" prefix if model adds it
             for prefix in ["Answer:", "answer:", "A:", "Response:", "response:", "My answer:", "The answer is:"]:
                 if answer.startswith(prefix):
                     answer = answer[len(prefix):].strip()
-            # Take only first line if multi-line (for short-answer fields)
-            if options or len(answer) > 200:
+            # Split lines for dropdowns or numeric fields
+            if options or is_numeric or len(answer) > 200:
                 answer = answer.split('\n')[0].strip()
 
             log.info(f"🤖 LLM answered: '{question[:50]}' → '{answer[:80]}'")
             return answer
 
     except urllib.error.URLError as e:
-        log.warning(f"⚠️ Ollama not reachable: {e}. Is Ollama running? (Run: ollama serve)")
+        log.warning(f"⚠️ Ollama not reachable: {e}. Is Ollama running?")
         return None
     except Exception as e:
         log.warning(f"⚠️ LLM call failed: {e}")
@@ -166,100 +248,116 @@ def _call_ollama(question, options=None):
 
 # ─── Deterministic Answers (no LLM needed) ───────────────────
 def _deterministic_answer(question):
-    """Answer common personal-info questions instantly without LLM."""
+    """Answer common personal-info questions instantly without LLM using strict word boundaries."""
     q = question.lower().strip()
     p = config.PERSONAL
+    e = config.EDUCATION
+    exp = config.EXPERIENCE
 
     # Name
-    if any(w in q for w in ["first name", "given name"]):
+    if re.search(r"\bfirst\s*name\b|\bgiven\s*name\b", q):
         return p["first_name"]
-    if any(w in q for w in ["last name", "surname", "family name"]):
+    if re.search(r"\blast\s*name\b|\bsurname\b|\bfamily\s*name\b", q):
         return p["last_name"]
-    if any(w in q for w in ["full name", "your name", "candidate name"]):
+    if re.search(r"\bfull\s*name\b|\byour\s*name\b|\bcandidate\s*name\b", q):
         return f"{p['first_name']} {p['last_name']}"
 
     # Contact
-    if any(w in q for w in ["email", "e-mail"]):
+    if re.search(r"\bemail\b|\be-mail\b", q):
         return p["email"]
-    if any(w in q for w in ["phone", "mobile", "contact number", "cell number"]):
+    if re.search(r"\bphone\b|\bmobile\b|\bcontact\s*number\b|\bcell\s*number\b", q):
         return p["phone"]
 
     # Location
-    if "city" in q and "current" not in q.replace("current city", ""):
-        pass  # Let keyword or LLM handle generic "city" mentions
-    if any(w in q for w in ["current city", "city you live"]):
+    if re.search(r"\bcurrent\s*city\b|\bcity\s*you\s*live\b", q):
         return p["city"]
-    if any(w in q for w in ["state", "province"]):
+    if re.search(r"\bstate\b|\bprovince\b", q):
         return p["state"]
-    if any(w in q for w in ["zip", "pin code", "postal"]):
+    if re.search(r"\bzip\b|\bpin\s*code\b|\bpostal\b", q):
         return p["zip_code"]
-    if "country" in q:
+    if re.search(r"\bcountry\b", q):
         return p["country"]
-    if "location" in q and ("current" in q or "your" in q):
+    if re.search(r"\blocation\b", q) and re.search(r"\b(current|your)\b", q):
         return p["location"]
 
     # URLs
-    if "linkedin" in q:
+    if re.search(r"\blinkedin\b", q):
         return p["linkedin_url"]
-    if "github" in q:
+    if re.search(r"\bgithub\b", q):
         return config.GITHUB_URL
-    if any(w in q for w in ["portfolio", "website", "personal site", "personal url"]):
+    if re.search(r"\bportfolio\b|\bwebsite\b|\bpersonal\s*(site|url)\b", q):
         return config.PORTFOLIO_URL
 
     # Demographics
-    if "gender" in q:
+    if re.search(r"\bgender\b", q):
         return p["gender"]
-    if "age" in q:
+    if re.search(r"\bage\b|\byour\s*age\b|\bage\s*\(years\)", q):
         return p["age"]
-    if any(w in q for w in ["ethnicity", "race"]):
+    if re.search(r"\bethnicity\b|\brace\b", q):
         return p.get("ethnicity", "Asian")
-    if "veteran" in q:
+    if re.search(r"\bveteran\b", q):
         return p.get("veteran", "No")
-    if "disability" in q or "handicap" in q:
+    if re.search(r"\bdisability\b|\bhandicap\b", q):
         return p.get("disability", "No")
 
     # Education
-    if any(w in q for w in ["university", "college", "school name", "institution"]):
-        return config.EDUCATION["university"]
-    if any(w in q for w in ["graduation year", "year of graduation", "passing year", "passed out"]):
-        return config.EDUCATION["graduation_year"]
-    if any(w in q for w in ["gpa", "cgpa", "grade point"]):
-        return config.EDUCATION["gpa"]
-    if any(w in q for w in ["degree", "qualification"]) and "highest" not in q:
-        return config.EDUCATION["degree"]
-    if "highest" in q and any(w in q for w in ["education", "degree", "qualification"]):
-        return config.EDUCATION["highest_level"]
+    if re.search(r"\buniversity\b|\bcollege\b|\bschool\s*name\b|\binstitution\b", q):
+        return e["university"]
+    if re.search(r"\bgraduation\s*year\b|\byear\s*of\s*graduation\b|\bpassing\s*year\b|\bpassed\s*out\b", q):
+        return e["graduation_year"]
+    if re.search(r"\bgpa\b|\bcgpa\b|\bgrade\s*point\b", q):
+        return e["gpa"]
+    if re.search(r"\bdegree\b|\bqualification\b", q) and not re.search(r"\bhighest\b", q):
+        return e["degree"]
+    if re.search(r"\bhighest\b", q) and re.search(r"\b(education|degree|qualification)\b", q):
+        return e["highest_level"]
 
     # Current work
-    if any(w in q for w in ["current company", "current employer", "present company", "company name"]):
-        return config.EXPERIENCE["current_company"]
-    if any(w in q for w in ["current title", "current role", "current position", "designation", "job title"]):
-        return config.EXPERIENCE["current_title"]
+    if re.search(r"\bcurrent\s*company\b|\bcurrent\s*employer\b|\bpresent\s*company\b|\bcompany\s*name\b", q):
+        return exp["current_company"]
+    if re.search(r"\bcurrent\s*title\b|\bcurrent\s*role\b|\bcurrent\s*position\b|\bdesignation\b|\bjob\s*title\b", q):
+        return exp["current_title"]
 
     return None
 
 
 # ─── Keyword Matching (from SAVED_ANSWERS) ───────────────────
 def _keyword_match(question):
-    """Original keyword matching logic — uses config.SAVED_ANSWERS."""
+    """Original keyword matching logic — uses config.SAVED_ANSWERS with precise word boundaries."""
     q = question.lower().strip()
+    
+    # 1. Loop through SAVED_ANSWERS using word boundaries
     for keyword, answer in config.SAVED_ANSWERS.items():
-        if keyword.lower() in q:
+        kw = keyword.lower().strip()
+        # Use regex to match the exact keyword as a phrase/word boundary
+        if re.search(r'\b' + re.escape(kw) + r'\b', q):
+            # Special guard: if keyword is generic experience but question asks about a specific technology, bypass
+            if kw in ["years of experience", "experience"] and len(q.replace(kw, "").strip()) > 5:
+                continue
             return str(answer)
 
-    # Fixed fallbacks using config values (BUG FIX: was hardcoded "5")
-    if any(w in q for w in ["year", "experience", "how long", "how many"]):
+    # 2. Generic Fallbacks (ONLY triggers on general profile questions, NOT skill-specific questions)
+    has_general_word = re.search(r"\b(overall|total|professional|work)\b", q)
+    has_exp_word = re.search(r"\b(year|years|experience)\b", q)
+    
+    is_generic_experience = (has_general_word and has_exp_word) or (q in ["years of experience", "experience", "experience (years)"])
+    
+    if is_generic_experience:
         return config.EXPERIENCE.get("total_years", "1")
-    if any(w in q for w in ["salary", "ctc", "compensation", "pay", "package"]):
+        
+    if re.search(r"\b(salary|expected ctc|current ctc|compensation|pay|package)\b", q):
+        if re.search(r"\b(expected|target)\b", q):
+            return config.EXPERIENCE.get("expected_salary", "1200000")
         return config.EXPERIENCE.get("current_salary", "800000")
-    if any(w in q for w in ["notice", "join", "start date", "available from"]):
+        
+    if re.search(r"\b(notice|join|start date|available from)\b", q):
         return config.WORK_AUTH.get("notice_period", "Immediately")
 
     return None
 
 
 # ─── Main Entry Point ────────────────────────────────────────
-def find_answer(question_text, options=None):
+def find_answer(question_text, options=None, is_numeric=False):
     """
     Smart 3-tier answer engine:
       1. Deterministic rules (personal info — instant, free)
@@ -269,6 +367,7 @@ def find_answer(question_text, options=None):
     Args:
         question_text: The question/label text from the application form
         options: Optional list of dropdown/radio option strings
+        is_numeric: If True, constraints LLM output to integers only
 
     Returns:
         str: The best answer
@@ -276,32 +375,82 @@ def find_answer(question_text, options=None):
     if not question_text or not question_text.strip():
         return "Yes"
 
-    # Cache key includes options for dropdown-specific answers
-    cache_key = f"{question_text.strip().lower()}|{','.join(options) if options else ''}"
-    if cache_key in _answer_cache:
-        return _answer_cache[cache_key]
+    # SQLite Cache Lookup
+    cached = get_cached(question_text, options, is_numeric)
+    if cached is not None:
+        return cached
 
     # ── Tier 1: Deterministic (instant) ──
     answer = _deterministic_answer(question_text)
     if answer:
-        _answer_cache[cache_key] = answer
+        set_cached(question_text, options, answer, is_numeric)
         log.info(f"📋 Deterministic: '{question_text[:40]}' → '{answer[:30]}'")
         return answer
 
     # ── Tier 2: Keyword match (instant) ──
     answer = _keyword_match(question_text)
     if answer:
-        _answer_cache[cache_key] = answer
+        set_cached(question_text, options, answer, is_numeric)
         log.info(f"🔑 Keyword: '{question_text[:40]}' → '{answer[:30]}'")
         return answer
 
     # ── Tier 3: Ollama LLM (smart fallback) ──
-    answer = _call_ollama(question_text, options)
+    answer = _call_ollama(question_text, options, is_numeric)
     if answer:
-        _answer_cache[cache_key] = answer
+        set_cached(question_text, options, answer, is_numeric)
         return answer
 
     # ── Ultimate fallback ──
-    log.warning(f"⚠️ All tiers failed for: '{question_text[:60]}' → defaulting to 'Yes'")
-    _answer_cache[cache_key] = "Yes"
-    return "Yes"
+    fallback_val = "1" if is_numeric else "Yes"
+    log.warning(f"⚠️ All tiers failed for: '{question_text[:60]}' → defaulting to '{fallback_val}'")
+    set_cached(question_text, options, fallback_val, is_numeric)
+    return fallback_val
+
+
+# ─── Fuzzy Option Matcher ────────────────────────────────────
+def best_match_option(answer, options):
+    """
+    Given an LLM answer and a list of available form options,
+    return the best-matching option string.
+
+    Cascade:
+      1. Exact match
+      2. Case-insensitive exact match
+      3. Substring containment (answer in option or option in answer)
+      4. difflib fuzzy match (threshold > 0.5)
+      5. Return first option as last resort
+    """
+    if not options:
+        return answer
+    if not answer:
+        return options[0] if options else ""
+
+    answer_clean = answer.strip()
+
+    # 1. Exact match
+    for opt in options:
+        if opt.strip() == answer_clean:
+            return opt
+
+    # 2. Case-insensitive exact match
+    answer_lower = answer_clean.lower()
+    for opt in options:
+        if opt.strip().lower() == answer_lower:
+            return opt
+
+    # 3. Substring containment
+    for opt in options:
+        opt_lower = opt.strip().lower()
+        if answer_lower in opt_lower or opt_lower in answer_lower:
+            return opt
+
+    # 4. Fuzzy match (difflib)
+    matches = difflib.get_close_matches(answer_clean, [o.strip() for o in options], n=1, cutoff=0.5)
+    if matches:
+        for opt in options:
+            if opt.strip() == matches[0]:
+                return opt
+
+    # 5. Last resort: return first option
+    log.warning(f"⚠️ No good match for '{answer_clean}' in {options}. Using first option: '{options[0]}'")
+    return options[0]

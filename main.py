@@ -2,6 +2,15 @@ import os
 import sys
 import logging
 from concurrent.futures import ThreadPoolExecutor
+
+# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError when printing emojis
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import config
 
 # Logging setup for orchestrator

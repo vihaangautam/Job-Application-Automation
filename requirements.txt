@@ -1,2 +1,5 @@
 selenium>=4.15.0
 webdriver-manager>=4.0.0
+undetected-chromedriver>=3.5.5
+websockets>=16.0
+setuptools>=82.0.1

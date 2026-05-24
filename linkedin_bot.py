@@ -14,9 +14,20 @@ Run:
 import time
 import random
 import logging
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
+# Reconfigure stdout/stderr to UTF-8 on Windows to prevent UnicodeEncodeError when printing emojis
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+import selenium
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -29,20 +40,26 @@ from selenium.common.exceptions import (
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+import undetected_chromedriver as uc
 
 import config  # apna config.py
-from llm_answerer import find_answer
+from llm_answerer import find_answer, best_match_option
 
 # ─── Logging Setup ────────────────────────────────────────────
 log_file = f"applications_{datetime.now().strftime('%Y%m%d_%H%M')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
-    ]
-)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Ensure FileHandler writes with UTF-8 to prevent charmap/UnicodeEncodeError on Windows
+has_file_handler = any(isinstance(h, logging.FileHandler) for h in root_logger.handlers)
+if not has_file_handler:
+    try:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        root_logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Failed to add UTF-8 FileHandler: {e}")
+
 log = logging.getLogger(__name__)
 
 
@@ -59,26 +76,112 @@ def human_type(element, text):
         time.sleep(random.uniform(0.03, 0.12))
 
 
-# ─── Browser Setup ────────────────────────────────────────────
+# ─── Helper: React-Friendly Human Clear and Type ───────────────
+def human_clear_and_type(field, text):
+    """Click, clear using CTRL+A + DELETE (React-friendly), and type with human delays."""
+    try:
+        field.click()
+        sleep(0.1, 0.3)
+        field.send_keys(Keys.CONTROL + "a")
+        field.send_keys(Keys.DELETE)
+        sleep(0.1, 0.2)
+        for char in str(text):
+            field.send_keys(char)
+            time.sleep(random.uniform(0.04, 0.11))
+    except Exception as e:
+        log.debug(f"Clear and type failed: {e}")
+
+
+# ─── Helper: Numeric Safety Guard ──────────────────────────────
+def sanitize_if_numeric(field, answer, question_text):
+    """Detect if field expects numbers and sanitizes LLM output to clean digits."""
+    inputmode = field.get_attribute("inputmode") or ""
+    field_id = (field.get_attribute("id") or "").lower()
+    q = question_text.lower()
+
+    is_numeric = (
+        inputmode == "numeric"
+        or any(k in field_id for k in ["year", "salary", "ctc", "exp", "experience"])
+        or any(k in q for k in ["how many years", "salary", "ctc", "months", "experience"])
+    )
+
+    if is_numeric:
+        cleaned = re.sub(r"[^\d]", "", str(answer))
+        return cleaned if cleaned else "1"
+    return answer
+
+
+# ─── Helper: Human-like Scroll Randomizer ──────────────────────
+def human_scroll(driver, container_element):
+    """Simulate human-like scrolling inside a result list container."""
+    try:
+        # Scroll down slightly
+        scroll_down = random.randint(280, 420)
+        driver.execute_script("arguments[0].scrollTop += arguments[1]", container_element, scroll_down)
+        sleep(0.6, 1.4)
+        # Slight scroll back (correction)
+        scroll_up = random.randint(30, 80)
+        driver.execute_script("arguments[0].scrollTop -= arguments[1]", container_element, scroll_up)
+        sleep(0.3, 0.7)
+    except Exception as e:
+        log.debug(f"Human scroll failed: {e}")
+
+
+# ─── Helper: Safe click ────────────────────────────────────────
+def safe_click(driver, element):
+    """Attempt standard click first, fallback to JavaScript click if intercepted."""
+    try:
+        element.click()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except Exception:
+            return False
+
+
+# ─── Helper: Get Chrome Major Version ──────────────────────────
+def get_chrome_major_version():
+    """Dynamically discover the installed Chrome major version on Windows."""
+    import os
+    import re
+    paths = [
+        r"C:\Program Files\Google\Chrome\Application",
+        r"C:\Program Files (x86)\Google\Chrome\Application",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application")
+    ]
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                for entry in os.listdir(path):
+                    if re.match(r"^\d+(\.\d+)+$", entry):
+                        major = entry.split(".")[0]
+                        return int(major)
+            except Exception as e:
+                log.debug(f"Failed to scan directory {path} for Chrome version: {e}")
+    return None
+
+
+# ─── Browser Setup (Undetected Chromedriver) ──────────────────
 def get_driver():
     import os
-    options = Options()
+    options = uc.ChromeOptions()
     options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
     
     # ── PERSISTENT PROFILE TO REMEMBER LOGINS AND FORMS ──
     user_data_dir = os.path.join(os.getcwd(), "chrome_profile")
-    options.add_argument(f"user-data-dir={user_data_dir}")
+    options.add_argument(f"--user-data-dir={user_data_dir}")
 
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-
-    # Bot detection bypass
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
+    # uc.Chrome automatically fetches and initializes the best driver manager internally
+    chrome_version = get_chrome_major_version()
+    if chrome_version:
+        log.info(f"Detected Chrome major version: {chrome_version}. Using version_main={chrome_version}")
+        driver = uc.Chrome(options=options, version_main=chrome_version)
+    else:
+        log.info("Could not detect Chrome major version dynamically. Relying on default auto-detection.")
+        driver = uc.Chrome(options=options)
+        
     return driver
 
 
@@ -148,42 +251,566 @@ def get_job_cards(driver):
 
 
 # find_answer is imported from llm_answerer.py (LLM-powered)
+# best_match_option is imported for fuzzy dropdown/radio matching
 
 
-# ─── Fill Form Fields ─────────────────────────────────────────
-def fill_field(field, answer):
+# ─── Autocomplete / Typeahead Handler ──────────────────────
+def fill_autocomplete_field(driver, field, answer):
+    """
+    Handle LinkedIn's custom combobox/typeahead inputs.
+    These are <input role='combobox'> or inputs with aria-autocomplete.
+    Typing spawns a listbox; we must click a suggestion for the value to register.
+    """
+    try:
+        field.clear()
+        human_type(field, answer)
+        sleep(1.0, 2.0)  # Wait for suggestions to load
+
+        # Look for suggestion listbox appearing
+        try:
+            listbox = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((
+                    By.CSS_SELECTOR,
+                    "div[role='listbox'], ul[role='listbox'], "
+                    ".basic-typeahead__triggered-content, "
+                    ".fb-typeahead-result-container"
+                ))
+            )
+            suggestions = listbox.find_elements(
+                By.CSS_SELECTOR,
+                "div[role='option'], li[role='option'], "
+                ".basic-typeahead__selectable, "
+                ".fb-typeahead-result"
+            )
+
+            if suggestions:
+                # Find best matching suggestion
+                suggestion_texts = [s.text.strip() for s in suggestions if s.text.strip()]
+                if suggestion_texts:
+                    best = best_match_option(answer, suggestion_texts)
+                    for s in suggestions:
+                        if s.text.strip() == best:
+                            driver.execute_script("arguments[0].click();", s)
+                            log.info(f"🎯 Autocomplete: typed '{answer}' → selected '{best}'")
+                            return True
+                # If no text match, just click first suggestion
+                driver.execute_script("arguments[0].click();", suggestions[0])
+                log.info(f"🎯 Autocomplete: typed '{answer}' → selected first suggestion")
+                return True
+
+        except TimeoutException:
+            # No listbox appeared — field might accept raw text
+            # Try pressing Enter or Tab to confirm
+            field.send_keys(Keys.RETURN)
+            sleep(0.3, 0.5)
+            log.debug(f"Autocomplete: no suggestions for '{answer}', pressed Enter")
+            return True
+
+    except (ElementNotInteractableException, StaleElementReferenceException) as e:
+        log.debug(f"Autocomplete fill error: {e}")
+        return False
+
+
+# ─── Fill Form Fields (Enhanced) ─────────────────────────
+def fill_field(driver, field, answer, q_text=""):
+    """Fill a single form field with the given answer.
+    
+    Handles: <select>, radio/checkbox, autocomplete combobox, and plain inputs.
+    Uses fuzzy matching for dropdowns and smart radio selection.
+    """
     tag = field.tag_name.lower()
-    field_type = field.get_attribute("type") or ""
+    field_type = (field.get_attribute("type") or "").lower()
 
     try:
         if tag == "select":
             sel = Select(field)
-            try:
-                sel.select_by_visible_text(answer)
-            except Exception:
-                # Partial match try karo
-                for opt in sel.options:
-                    if answer.lower() in opt.text.lower():
-                        sel.select_by_visible_text(opt.text)
-                        break
+            # Get valid option texts (skip placeholders)
+            valid_options = [
+                opt.text.strip() for opt in sel.options
+                if opt.text.strip() and opt.text.strip() not in [
+                    "Select an option", "Select", "-- Select --", "Choose...", ""
+                ]
+            ]
+            if valid_options:
+                best = best_match_option(answer, valid_options)
+                selected = False
+                # Try 1: Native Selenium select
+                try:
+                    sel.select_by_visible_text(best)
+                    selected = True
+                    log.info(f"📥 Dropdown: '{q_text[:40]}' → '{best}'")
+                except Exception:
+                    pass
+                # Try 2: JavaScript fallback (for hidden/overlay selects)
+                if not selected:
+                    try:
+                        js_result = driver.execute_script("""
+                            var sel = arguments[0];
+                            var target = arguments[1].trim();
+                            for (var i = 0; i < sel.options.length; i++) {
+                                if (sel.options[i].text.trim() === target) {
+                                    sel.selectedIndex = i;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    sel.dispatchEvent(new Event('input', {bubbles: true}));
+                                    return true;
+                                }
+                            }
+                            // Partial match fallback
+                            var targetLower = target.toLowerCase();
+                            for (var i = 0; i < sel.options.length; i++) {
+                                var optText = sel.options[i].text.trim().toLowerCase();
+                                if (optText.indexOf(targetLower) !== -1 || targetLower.indexOf(optText) !== -1) {
+                                    sel.selectedIndex = i;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    sel.dispatchEvent(new Event('input', {bubbles: true}));
+                                    return true;
+                                }
+                            }
+                            return false;
+                        """, field, best)
+                        if js_result:
+                            selected = True
+                            log.info(f"📥 Dropdown (JS): '{q_text[:40]}' → '{best}'")
+                    except Exception as e:
+                        log.debug(f"JS select failed: {e}")
+                # Try 3: Last resort — select first valid option via JS
+                if not selected and valid_options:
+                    try:
+                        driver.execute_script("""
+                            var sel = arguments[0];
+                            var target = arguments[1].trim();
+                            for (var i = 0; i < sel.options.length; i++) {
+                                if (sel.options[i].text.trim() === target) {
+                                    sel.selectedIndex = i;
+                                    sel.dispatchEvent(new Event('change', {bubbles: true}));
+                                    sel.dispatchEvent(new Event('input', {bubbles: true}));
+                                    break;
+                                }
+                            }
+                        """, field, valid_options[0])
+                        log.warning(f"⚠️ Dropdown fallback (JS): '{q_text[:40]}' → '{valid_options[0]}'")
+                    except Exception as e:
+                        log.debug(f"JS select fallback failed: {e}")
+            else:
+                log.debug(f"No valid dropdown options found for: {q_text[:40]}")
 
         elif field_type in ["radio", "checkbox"]:
+            # Don't blindly click — handled at question-block level by fill_radio_group()
             if not field.is_selected():
                 try:
-                    # In LinkedIn, the input is often hidden and the label needs to be clicked
                     parent_label = field.find_element(By.XPATH, "./following-sibling::label")
                     parent_label.click()
                 except Exception:
-                    # Fallback to direct clicking
-                    field.click()
+                    try:
+                        driver.execute_script("arguments[0].click();", field)
+                    except Exception:
+                        field.click()
 
         elif tag in ["input", "textarea"]:
-            if field_type not in ["file", "submit", "button"]:
-                field.clear()
-                human_type(field, answer)
+            if field_type not in ["file", "submit", "button", "hidden"]:
+                # Check if this is an autocomplete/combobox field
+                role = field.get_attribute("role") or ""
+                aria_auto = field.get_attribute("aria-autocomplete") or ""
+                if role == "combobox" or aria_auto in ["list", "both"]:
+                    fill_autocomplete_field(driver, field, answer)
+                else:
+                    # Sanitize if numeric
+                    answer_clean = sanitize_if_numeric(field, answer, q_text)
+                    
+                    # Check if field already has the correct value
+                    current_val = field.get_attribute("value") or ""
+                    if current_val.strip() == str(answer_clean).strip():
+                        log.debug(f"Field already has correct value: '{answer_clean}'")
+                        return
+                    human_clear_and_type(field, answer_clean)
 
     except (ElementNotInteractableException, StaleElementReferenceException) as e:
         log.debug(f"Field fill error: {e}")
+
+
+# ─── Fill Radio Group (Smart) ───────────────────────────
+def fill_radio_group(driver, q_block, answer):
+    """Find the best-matching radio/checkbox option in a question block and click it."""
+    try:
+        # Find all radio/checkbox inputs with their labels
+        radio_inputs = q_block.find_elements(By.CSS_SELECTOR, "input[type='radio'], input[type='checkbox']")
+        if not radio_inputs:
+            return False
+
+        # Build label-to-input mapping
+        options_map = {}  # label_text -> input_element
+        for inp in radio_inputs:
+            label_text = ""
+            try:
+                label_el = inp.find_element(By.XPATH, "./following-sibling::label")
+                label_text = label_el.text.strip()
+            except Exception:
+                try:
+                    # Try parent label
+                    label_el = inp.find_element(By.XPATH, "./ancestor::label")
+                    label_text = label_el.text.strip()
+                except Exception:
+                    pass
+            if label_text:
+                options_map[label_text] = inp
+
+        if not options_map:
+            # No labels found, click first unchecked
+            for inp in radio_inputs:
+                if not inp.is_selected():
+                    safe_click(driver, inp)
+                    return True
+            return False
+
+        # Use fuzzy matching to find the best label
+        best_label = best_match_option(answer, list(options_map.keys()))
+        target_input = options_map.get(best_label)
+
+        if target_input and not target_input.is_selected():
+            clicked = False
+            try:
+                label_el = target_input.find_element(By.XPATH, "./following-sibling::label")
+                clicked = safe_click(driver, label_el)
+            except Exception:
+                pass
+            if not clicked:
+                clicked = safe_click(driver, target_input)
+            if clicked:
+                log.info(f"🔘 Radio: selected '{best_label}'")
+                return True
+
+    except (StaleElementReferenceException, Exception) as e:
+        log.debug(f"Radio fill error: {e}")
+    return False
+
+
+# ─── Fill All Form Fields on Current Page ─────────────────────
+def fill_form_fields(driver):
+    """Scan the current Easy Apply page for all question blocks and fill them."""
+    try:
+        # Restrict form filling STRICTLY to the active Easy Apply modal container
+        # to avoid interacting with background widgets, messaging drawers, or global settings triggers
+        container = driver
+        for selector in [".jobs-easy-apply-modal", "div[role='dialog']", ".artdeco-modal", ".jobs-easy-apply-content"]:
+            try:
+                modal_el = driver.find_element(By.CSS_SELECTOR, selector)
+                if modal_el.is_displayed():
+                    container = modal_el
+                    break
+            except Exception:
+                pass
+
+        questions = container.find_elements(
+            By.CSS_SELECTOR,
+            ".jobs-easy-apply-form-section__grouping, "
+            ".fb-form-element, "
+            ".jobs-easy-apply-form-element"
+        )
+
+        for q_block in questions:
+            try:
+                # Extract question text
+                label_el = None
+                for sel in ["label", ".fb-dash-form-element__label", ".t-bold", "span"]:
+                    try:
+                        label_el = q_block.find_element(By.CSS_SELECTOR, sel)
+                        break
+                    except Exception:
+                        pass
+
+                q_text = label_el.text if label_el else ""
+
+                # Extract dropdown/radio options for LLM context
+                options = []
+
+                # 1. Native <select> options
+                try:
+                    select_els = q_block.find_elements(By.CSS_SELECTOR, "select")
+                    for sel_el in select_els:
+                        sel = Select(sel_el)
+                        options = [opt.text.strip() for opt in sel.options
+                                   if opt.text.strip() and opt.text.strip() not in [
+                                       "Select an option", "Select", "-- Select --", "Choose...", ""
+                                   ]]
+                except Exception:
+                    pass
+
+                # 2. Radio button labels
+                if not options:
+                    try:
+                        radio_labels = q_block.find_elements(
+                            By.CSS_SELECTOR,
+                            "input[type='radio'] + label, "
+                            "fieldset label"
+                        )
+                        options = [lbl.text.strip() for lbl in radio_labels if lbl.text.strip()]
+                    except Exception:
+                        pass
+
+                # 3. Custom listbox/autocomplete options (LinkedIn-specific)
+                if not options:
+                    try:
+                        listbox_opts = q_block.find_elements(
+                            By.CSS_SELECTOR,
+                            "div[role='option'], li[role='option'], "
+                            ".basic-typeahead__selectable"
+                        )
+                        options = [opt.text.strip() for opt in listbox_opts if opt.text.strip()]
+                    except Exception:
+                        pass
+
+                # Determine if numeric context
+                is_numeric = False
+                try:
+                    fields = q_block.find_elements(By.CSS_SELECTOR, "input, select, textarea")
+                    for field in fields:
+                        if field.tag_name.lower() in ["input", "textarea"]:
+                            inputmode = field.get_attribute("inputmode") or ""
+                            field_id = (field.get_attribute("id") or "").lower()
+                            q = q_text.lower()
+                            if (inputmode == "numeric" or 
+                                any(k in field_id for k in ["year", "salary", "ctc", "exp", "experience"]) or 
+                                any(k in q for k in ["how many years", "salary", "ctc", "months", "experience"])):
+                                is_numeric = True
+                                break
+                except Exception:
+                    pass
+
+                # Get answer (with options and is_numeric context for LLM)
+                answer = find_answer(q_text, options=options if options else None, is_numeric=is_numeric)
+
+                # Handle custom dropdowns (LinkedIn-specific artdeco dropdown buttons)
+                custom_dropdown_selected = False
+                try:
+                    dropdown_triggers = q_block.find_elements(
+                        By.CSS_SELECTOR,
+                        "button[aria-haspopup='listbox'], "
+                        "button.artdeco-dropdown__trigger, "
+                        "button[aria-expanded]"
+                    )
+                    for trigger in dropdown_triggers:
+                        btn_text = trigger.text.lower()
+                        if any(w in btn_text for w in ["continue", "next", "review", "submit", "cancel", "dismiss"]):
+                            continue
+                        
+                        # Click to open dropdown trigger
+                        if safe_click(driver, trigger):
+                            sleep(0.5, 1.0)
+                            suggestions = driver.find_elements(
+                                By.CSS_SELECTOR,
+                                "div[role='option'], li[role='option'], .artdeco-dropdown__item, .basic-typeahead__selectable"
+                            )
+                            if suggestions:
+                                suggestion_texts = [s.text.strip() for s in suggestions if s.text.strip()]
+                                if suggestion_texts:
+                                    best = best_match_option(answer, suggestion_texts)
+                                    clicked_opt = False
+                                    for s in suggestions:
+                                        if s.text.strip() == best:
+                                            safe_click(driver, s)
+                                            clicked_opt = True
+                                            log.info(f"📥 Custom Dropdown: '{q_text[:40]}' → selected '{best}'")
+                                            custom_dropdown_selected = True
+                                            break
+                                    if not clicked_opt:
+                                        safe_click(driver, suggestions[0])
+                                        log.info(f"📥 Custom Dropdown (fallback): selected first option '{suggestion_texts[0]}'")
+                                        custom_dropdown_selected = True
+                                    sleep(0.3)
+                except Exception as e:
+                    log.debug(f"Custom dropdown fill error: {e}")
+
+                # Handle radio/checkbox groups specially (smart matching)
+                has_radios = q_block.find_elements(
+                    By.CSS_SELECTOR, "input[type='radio'], input[type='checkbox']"
+                )
+                if has_radios:
+                    fill_radio_group(driver, q_block, answer)
+
+                # Fill all other fields in this question block
+                fields = q_block.find_elements(
+                    By.CSS_SELECTOR,
+                    "input, select, textarea"
+                )
+                for field in fields:
+                    f_type = (field.get_attribute("type") or "").lower()
+                    # Skip radio/checkbox (already handled above) and file inputs
+                    if f_type in ["radio", "checkbox", "file"]:
+                        continue
+                    # Skip select/inputs that we already filled via custom dropdown to avoid conflicts
+                    if custom_dropdown_selected and field.tag_name.lower() == "select":
+                        continue
+                    fill_field(driver, field, answer, q_text=q_text)
+                    sleep(0.2, 0.5)
+
+            except StaleElementReferenceException:
+                pass
+
+        # ─── PASS 2: Ultra-Generic Pass (handles custom/nested ATS forms like PyjamaHR) ───
+        # Confined strictly to the active modal/form container
+        all_fields = container.find_elements(
+            By.CSS_SELECTOR,
+            "input, select, textarea, button[aria-haspopup='listbox'], button.artdeco-dropdown__trigger, button[aria-expanded]"
+        )
+
+        for field in all_fields:
+            try:
+                f_type = (field.get_attribute("type") or "").lower()
+                tag = field.tag_name.lower()
+
+                # Skip submits, cancels, files, and hidden inputs
+                if f_type in ["hidden", "submit", "button", "file"] and tag != "button":
+                    continue
+
+                if tag == "button":
+                    btn_text = field.text.lower()
+                    if any(w in btn_text for w in ["continue", "next", "review", "submit", "cancel", "dismiss"]):
+                        continue
+
+                # Find the question/label text for this specific field
+                q_text = ""
+
+                # 1. Try finding associated label by 'id'/'for'
+                f_id = field.get_attribute("id")
+                if f_id:
+                    try:
+                        lbl = container.find_element(By.CSS_SELECTOR, f"label[for='{f_id}']")
+                        q_text = lbl.text.strip()
+                    except Exception:
+                        pass
+
+                # 2. Try looking for ancestor labels or surrounding text (parent)
+                if not q_text:
+                    try:
+                        parent = field.find_element(By.XPATH, "./..")
+                        for sel in ["label", "span", "p", ".t-bold", ".fb-dash-form-element__label", "h3", "h4"]:
+                            try:
+                                lbl = parent.find_element(By.CSS_SELECTOR, sel)
+                                if lbl.text.strip():
+                                    q_text = lbl.text.strip()
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # 3. Try grandparent surrounding text
+                if not q_text:
+                    try:
+                        gparent = field.find_element(By.XPATH, "./../..")
+                        for sel in ["label", "span", "p", ".t-bold", ".fb-dash-form-element__label", "h3", "h4"]:
+                            try:
+                                lbl = gparent.find_element(By.CSS_SELECTOR, sel)
+                                if lbl.text.strip():
+                                    q_text = lbl.text.strip()
+                                    break
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # 4. Try aria-label or placeholder
+                if not q_text:
+                    q_text = field.get_attribute("aria-label") or field.get_attribute("placeholder") or ""
+
+                q_text = q_text.strip()
+                if not q_text:
+                    continue
+
+                # Clean up newlines in label text to make matching consistent
+                q_text = " ".join(q_text.split())
+
+                # Determine if numeric context
+                is_numeric = False
+                if tag in ["input", "textarea"]:
+                    inputmode = field.get_attribute("inputmode") or ""
+                    field_id = (field.get_attribute("id") or "").lower()
+                    q = q_text.lower()
+                    if (inputmode == "numeric" or 
+                        any(k in field_id for k in ["year", "salary", "ctc", "exp", "experience"]) or 
+                        any(k in q for k in ["how many years", "salary", "ctc", "months", "experience"])):
+                        is_numeric = True
+
+                # Skip if already filled
+                if tag in ["input", "textarea"]:
+                    current_val = field.get_attribute("value") or ""
+                    if current_val.strip() and f_type not in ["radio", "checkbox"]:
+                        continue
+                elif tag == "select":
+                    sel = Select(field)
+                    try:
+                        if sel.first_selected_option.text.strip() not in ["Select an option", "Select", "-- Select --", "Choose...", ""]:
+                            continue
+                    except Exception:
+                        pass
+
+                # Extract dropdown options for context
+                options = []
+                if tag == "select":
+                    try:
+                        sel = Select(field)
+                        options = [opt.text.strip() for opt in sel.options
+                                   if opt.text.strip() and opt.text.strip() not in [
+                                       "Select an option", "Select", "-- Select --", "Choose...", ""
+                                   ]]
+                    except Exception:
+                        pass
+                elif f_type in ["radio", "checkbox"]:
+                    # Radio groups are filled at parent level
+                    try:
+                        parent = field.find_element(By.XPATH, "./..")
+                        radios = parent.find_elements(By.CSS_SELECTOR, "input[type='radio'], input[type='checkbox']")
+                        if len(radios) > 1:
+                            # Verify if any radio in this group is already selected
+                            any_selected = any(r.is_selected() for r in radios)
+                            if any_selected:
+                                continue
+                            answer = find_answer(q_text, is_numeric=is_numeric)
+                            fill_radio_group(driver, parent, answer)
+                            continue
+                    except Exception:
+                        pass
+                    # If single checkbox, we can click it if answer is Yes
+                    answer = find_answer(q_text, is_numeric=is_numeric)
+                    if "yes" in str(answer).lower() and not field.is_selected():
+                        safe_click(driver, field)
+                    continue
+
+                # Get answer for general fields
+                answer = find_answer(q_text, options=options if options else None, is_numeric=is_numeric)
+
+                # Fill the field
+                if tag == "button":
+                    # Click to open dropdown trigger
+                    if safe_click(driver, field):
+                        sleep(0.5, 1.0)
+                        suggestions = driver.find_elements(
+                            By.CSS_SELECTOR,
+                            "div[role='option'], li[role='option'], .artdeco-dropdown__item, .basic-typeahead__selectable"
+                        )
+                        if suggestions:
+                            suggestion_texts = [s.text.strip() for s in suggestions if s.text.strip()]
+                            if suggestion_texts:
+                                best = best_match_option(answer, suggestion_texts)
+                                clicked_opt = False
+                                for s in suggestions:
+                                    if s.text.strip() == best:
+                                        safe_click(driver, s)
+                                        clicked_opt = True
+                                        log.info(f"📥 Generic Custom Dropdown: '{q_text[:40]}' → selected '{best}'")
+                                        break
+                                if not clicked_opt:
+                                    safe_click(driver, suggestions[0])
+                                sleep(0.3)
+                else:
+                    fill_field(driver, field, answer, q_text=q_text)
+                    sleep(0.2)
+
+            except Exception as e:
+                log.debug(f"Generic field fill error: {e}")
+
+    except Exception as e:
+        log.debug(f"Form fill error: {e}")
 
 
 # ─── Wait for Loaders ─────────────────────────────────────────
@@ -254,65 +881,7 @@ def handle_easy_apply_modal(driver, job_title):
             pass
 
         # ── Fill All Visible Fields (with LLM + option extraction) ──
-        try:
-            questions = driver.find_elements(
-                By.CSS_SELECTOR,
-                ".jobs-easy-apply-form-section__grouping, "
-                ".fb-form-element, "
-                ".jobs-easy-apply-form-element"
-            )
-
-            for q_block in questions:
-                try:
-                    # Extract question text
-                    label_el = None
-                    for sel in ["label", ".fb-dash-form-element__label", ".t-bold", "span"]:
-                        try:
-                            label_el = q_block.find_element(By.CSS_SELECTOR, sel)
-                            break
-                        except Exception:
-                            pass
-
-                    q_text = label_el.text if label_el else ""
-
-                    # Extract dropdown/radio options for LLM context
-                    options = []
-                    try:
-                        select_els = q_block.find_elements(By.CSS_SELECTOR, "select")
-                        for sel_el in select_els:
-                            sel = Select(sel_el)
-                            options = [opt.text.strip() for opt in sel.options
-                                       if opt.text.strip() and opt.text.strip() != "Select an option"]
-                    except Exception:
-                        pass
-                    if not options:
-                        try:
-                            radio_labels = q_block.find_elements(
-                                By.CSS_SELECTOR,
-                                "input[type='radio'] + label, "
-                                "fieldset label"
-                            )
-                            options = [lbl.text.strip() for lbl in radio_labels if lbl.text.strip()]
-                        except Exception:
-                            pass
-
-                    # Get answer (with options context for LLM)
-                    answer = find_answer(q_text, options=options if options else None)
-
-                    # Fill all fields in this question block
-                    fields = q_block.find_elements(
-                        By.CSS_SELECTOR,
-                        "input, select, textarea"
-                    )
-                    for field in fields:
-                        fill_field(field, answer)
-                        sleep(0.2, 0.5)
-
-                except StaleElementReferenceException:
-                    pass
-
-        except Exception as e:
-            log.debug(f"Form fill error: {e}")
+        fill_form_fields(driver)
 
         # ── Wait for loaders before clicking buttons ───────
         wait_for_loader(driver)
@@ -330,7 +899,7 @@ def handle_easy_apply_modal(driver, job_title):
         except NoSuchElementException:
             pass
 
-        # ── Next / Review button ───────────────────────────
+        # ── Next / Review button (with validation retry) ───
         try:
             next_btn = driver.find_element(
                 By.CSS_SELECTOR,
@@ -339,6 +908,36 @@ def handle_easy_apply_modal(driver, job_title):
             )
             driver.execute_script("arguments[0].click();", next_btn)
             sleep(1.5, 2.5)
+
+            # Check for validation errors after clicking Next
+            validation_errors = driver.find_elements(
+                By.CSS_SELECTOR,
+                ".artdeco-inline-feedback--error .artdeco-inline-feedback__message, "
+                ".fb-dash-form-element__error-field, "
+                "div[data-test-form-element-error-message]"
+            )
+            # Filter to only real error messages (short text, not dropdown content)
+            error_texts = []
+            for e in validation_errors:
+                txt = e.text.strip()
+                if txt and len(txt) < 200 and '\n' not in txt:
+                    error_texts.append(txt)
+            if error_texts:
+                log.warning(f"⚠️ Validation errors: {error_texts}. Retrying fill...")
+                # Re-fill the form fields — the retry will fix unfilled required fields
+                fill_form_fields(driver)
+                sleep(0.5, 1)
+                # Try clicking Next again
+                try:
+                    next_btn = driver.find_element(
+                        By.CSS_SELECTOR,
+                        "button[aria-label='Continue to next step'], "
+                        "button[aria-label='Review your application']"
+                    )
+                    driver.execute_script("arguments[0].click();", next_btn)
+                    sleep(1.5, 2.5)
+                except NoSuchElementException:
+                    pass
             continue
         except NoSuchElementException:
             pass
@@ -448,7 +1047,8 @@ def apply_to_job(driver, job_card, applied_titles):
 # ─── Save Applied Log ─────────────────────────────────────────
 def save_log(applied_titles):
     log_path = f"applied_jobs_{datetime.now().strftime('%Y%m%d')}.txt"
-    with open(log_path, "w") as f:
+    # Specify utf-8 encoding to prevent UnicodeEncodeError on Windows due to emojis/symbols
+    with open(log_path, "w", encoding="utf-8") as f:
         f.write(f"Applied Jobs — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
         f.write("=" * 60 + "\n")
         for title in sorted(applied_titles):
@@ -482,12 +1082,18 @@ def run_linkedin_bot():
             while True:
                 log.info(f"📄 Page {page} — Keyword: '{keyword}'")
 
-                # Scroll to load all cards
-                for _ in range(5):
-                    driver.execute_script(
-                        "document.querySelector('.jobs-search-results-list')?.scrollBy(0, 500)"
-                    )
-                    sleep(0.5, 1)
+                # Scroll to load all cards with anti-detection human scroll
+                try:
+                    container_el = driver.find_element(By.CSS_SELECTOR, ".jobs-search-results-list")
+                    for _ in range(5):
+                        human_scroll(driver, container_el)
+                except Exception:
+                    # Fallback in case container selector is not active
+                    for _ in range(5):
+                        driver.execute_script(
+                            "document.querySelector('.jobs-search-results-list')?.scrollBy(0, 500)"
+                        )
+                        sleep(0.5, 1.0)
 
                 cards = get_job_cards(driver)
                 log.info(f"   {len(cards)} jobs mile")
