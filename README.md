@@ -275,16 +275,3 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 
 ---
 
-## 👤 Author
-
-**Rayees Yousuf**  
-AI Automation & Agent Builder
-
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?style=for-the-badge&logo=linkedin)](https://www.linkedin.com/in/rayeesyousuf/)
-[![GitHub](https://img.shields.io/badge/GitHub-Follow-181717?style=for-the-badge&logo=github)](https://github.com/RayeesYousufGenAi)
-
----
-
-<p align="center">
-  <strong>⭐ Star this repo if it helped you land interviews!</strong>
-</p>
